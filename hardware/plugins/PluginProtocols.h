@@ -39,6 +39,11 @@ namespace Plugins {
 		virtual void	ProcessInbound(const ReadEvent* Message);
 	};
 
+	class CPluginProtocolFormattedJSON : CPluginProtocol
+	{
+		virtual void	ProcessInbound(const ReadEvent* Message);
+	};
+
 	class CPluginProtocolHTTP : CPluginProtocol
 	{
 	private:

@@ -12,14 +12,18 @@
 #include "../webserver/Base64.h"
 #include "icmp_header.hpp"
 #include "ipv4_header.hpp"
+#include "../json/json.h"
 
 namespace Plugins {
 
-	CPluginProtocol * CPluginProtocol::Create(std::string sProtocol, std::string sUsername, std::string sPassword)
+	CPluginProtocol * CPluginProtocol::Create(std::string Protocol, std::string sUsername, std::string sPassword)
 	{
-		if (sProtocol == "Line") return (CPluginProtocol*) new CPluginProtocolLine();
+		std::string	sProtocol = Protocol;
+		std::transform(sProtocol.begin(), sProtocol.end(), sProtocol.begin(), ::toupper);
+		if (sProtocol == "LINE") return (CPluginProtocol*) new CPluginProtocolLine();
 		else if (sProtocol == "XML") return (CPluginProtocol*) new CPluginProtocolXML();
 		else if (sProtocol == "JSON") return (CPluginProtocol*) new CPluginProtocolJSON();
+		else if (sProtocol == "FORMATTEDJSON") return (CPluginProtocol*) new CPluginProtocolFormattedJSON();
 		else if ((sProtocol == "HTTP") || (sProtocol == "HTTPS"))
 		{
 			CPluginProtocolHTTP*	pProtocol = new CPluginProtocolHTTP(sProtocol == "HTTPS");
@@ -279,7 +283,23 @@ static void AddIntToDict(PyObject* pDict, const char* key, const int value)
 	Py_DECREF(pObj);
 }
 
-	void CPluginProtocolHTTP::ProcessInbound(const ReadEvent* Message)
+static void AddUIntToDict(PyObject* pDict, const char* key, const unsigned int value)
+{
+	PyObject*	pObj = Py_BuildValue("I", value);
+	if (PyDict_SetItemString(pDict, key, pObj) == -1)
+		_log.Log(LOG_ERROR, "(%s) failed to add key '%s', value '%d' to dictionary.", __func__, key, value);
+	Py_DECREF(pObj);
+}
+
+static void AddDoubleToDict(PyObject* pDict, const char* key, const double value)
+{
+	PyObject*	pObj = Py_BuildValue("d", value);
+	if (PyDict_SetItemString(pDict, key, pObj) == -1)
+		_log.Log(LOG_ERROR, "(%s) failed to add key '%s', value '%f' to dictionary.", __func__, key, value);
+	Py_DECREF(pObj);
+}
+
+void CPluginProtocolHTTP::ProcessInbound(const ReadEvent* Message)
 	{
 		m_sRetainedData.insert(m_sRetainedData.end(), Message->m_Buffer.begin(), Message->m_Buffer.end());
 
@@ -1363,6 +1383,119 @@ static void AddIntToDict(PyObject* pDict, const char* key, const int value)
 		retVal.insert(retVal.end(), vPayload.begin(), vPayload.end());
 
 		return retVal;
+	}
+
+	static PyObject*	JSONtoPython(Json::Value*	pJSON)
+	{
+		PyObject*	pRetVal = NULL;
+
+		if (pJSON->isArray())
+		{
+			pRetVal = PyList_New(pJSON->size());
+			Py_ssize_t	Index = 0;
+			for (Json::ValueIterator it = pJSON->begin(); it != pJSON->end(); ++it)
+			{
+				Json::ValueIterator::reference	pRef = *it;
+				if (it->isArray() || it->isObject())
+				{
+					PyObject*	pObj = JSONtoPython(&pRef);
+					if (!pObj || (PyList_SetItem(pRetVal, Index++, pObj) == -1))
+						_log.Log(LOG_ERROR, "(%s) failed to add item '%d', to list for object.", __func__, Index-1);
+				}
+				else if (it->isUInt())
+				{
+					PyObject*	pObj = Py_BuildValue("I", it->asUInt());
+					if (!pObj || (PyList_SetItem(pRetVal, Index++, pObj) == -1))
+						_log.Log(LOG_ERROR, "(%s) failed to add item '%d', to list for unsigned integer.", __func__, Index - 1);
+				}
+				else if (it->isInt())
+				{
+					PyObject*	pObj = Py_BuildValue("i", it->asInt());
+					if (!pObj || (PyList_SetItem(pRetVal, Index++, pObj) == -1))
+						_log.Log(LOG_ERROR, "(%s) failed to add item '%d', to list for integer.", __func__, Index - 1);
+				}
+				else if (it->isDouble())
+				{
+					PyObject*	pObj = Py_BuildValue("d", it->asDouble());
+					if (!pObj || (PyList_SetItem(pRetVal, Index++, pObj) == -1))
+						_log.Log(LOG_ERROR, "(%s) failed to add item '%d', to list for double.", __func__, Index - 1);
+				}
+				else if (it->isConvertibleTo(Json::stringValue))
+				{
+					std::string	sString = it->asString();
+					PyObject*	pObj = Py_BuildValue("s#", sString.c_str(), sString.length());
+					if (!pObj || (PyList_SetItem(pRetVal, Index++, pObj) == -1))
+						_log.Log(LOG_ERROR, "(%s) failed to add item '%d', to list for string.", __func__, Index - 1);
+				}
+				else
+					_log.Log(LOG_ERROR, "(%s) failed to process entry.", __func__);
+			}
+		}
+		else if (pJSON->isObject())
+		{
+			pRetVal = PyDict_New();
+			for (Json::ValueIterator it = pJSON->begin(); it != pJSON->end(); ++it)
+			{
+				std::string						KeyName = it.name();
+				Json::ValueIterator::reference	pRef = *it;
+				if (it->isArray() || it->isObject())
+				{
+					PyObject*	pObj = JSONtoPython(&pRef);
+					if (!pObj || (PyDict_SetItemString(pRetVal, KeyName.c_str(), pObj) == -1))
+						_log.Log(LOG_ERROR, "(%s) failed to add key '%s', to dictionary for object.", __func__, KeyName.c_str());
+				}
+				else if (it->isUInt()) AddUIntToDict(pRetVal, KeyName.c_str(), it->asUInt());
+				else if (it->isInt()) AddIntToDict(pRetVal, KeyName.c_str(), it->asInt());
+				else if (it->isDouble()) AddDoubleToDict(pRetVal, KeyName.c_str(), it->asDouble());
+				else if (it->isConvertibleTo(Json::stringValue)) AddStringToDict(pRetVal, KeyName.c_str(), it->asString());
+				else _log.Log(LOG_ERROR, "(%s) failed to process entry for '%s'.", __func__, KeyName.c_str());
+			}
+		}
+		return pRetVal;
+	}
+
+	void CPluginProtocolFormattedJSON::ProcessInbound(const ReadEvent* Message)
+	{
+		//
+		//	Handles the cases where a read contains a partial message or multiple messages
+		//
+		std::vector<byte>	vData = m_sRetainedData;										// if there was some data left over from last time add it back in
+		vData.insert(vData.end(), Message->m_Buffer.begin(), Message->m_Buffer.end());		// add the new data
+
+		std::string		sData(vData.begin(), vData.end());
+		int iPos = 1;
+		while (iPos) {
+			iPos = sData.find("}{", 0) + 1;		//  Look for message separater in case there is more than one
+			if (!iPos) // no, just one or part of one
+			{
+				if ((sData.substr(sData.length() - 1, 1) == "}") &&
+					(std::count(sData.begin(), sData.end(), '{') == std::count(sData.begin(), sData.end(), '}'))) // whole message so queue the whole buffer
+				{
+					Json::Reader	jReader;
+					Json::Value		root;
+					bool bRet = jReader.parse(sData, root);
+					if ((!bRet) || (!root.isObject()))
+					{
+						_log.Log(LOG_ERROR, "JSON Protocol: Parse Error on '%s'", sData.c_str());
+						Message->m_pPlugin->MessagePlugin(new onMessageCallback(Message->m_pPlugin, Message->m_pConnection, sData));
+					}
+					else
+					{
+						PyObject*	pMessage = JSONtoPython(&root);
+						Message->m_pPlugin->MessagePlugin(new onMessageCallback(Message->m_pPlugin, Message->m_pConnection, pMessage));
+					}
+					sData.clear();
+				}
+			}
+			else  // more than one message so queue the first one
+			{
+				std::string sMessage = sData.substr(0, iPos);
+				sData = sData.substr(iPos);
+				Message->m_pPlugin->MessagePlugin(new onMessageCallback(Message->m_pPlugin, Message->m_pConnection, sMessage));
+			}
+		}
+
+		m_sRetainedData.assign(sData.c_str(), sData.c_str() + sData.length()); // retain any residual for next time
 	}
 }
 #endif
